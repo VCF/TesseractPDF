@@ -1,0 +1,5 @@
+# http://git-scm.com/book/en/Git-Basics-Recording-Changes-to-the-Repository
+
+# Keep out emacs temp files
+*~
+
