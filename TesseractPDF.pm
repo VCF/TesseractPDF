@@ -154,9 +154,11 @@ sub new {
         TEXT       => "",
         MINFTPT    => 5,
         WORKDIR    => "TesseractPDF",
+        ENGINE     => "Tesseract",
     };
     bless $self, $class;
     my $args = $self->parseparams( @_ );
+    $self->engine( $args->{ENGINE} );
     # Bootstrap the font to set the values for the scratch object:
     $self->font_name( $self->font_name( $args->{FONT}) );
     $self->scan_resolution( $args->{SCANDPI} );
@@ -193,6 +195,20 @@ sub api2 {
         $self->{PDFAPI2} = PDF::API2->new();
     }
     return $self->{PDFAPI2};
+}
+
+sub engine {
+    my $self = shift;
+    if (my $nv = shift) {
+        if ($nv =~ /tess/i) {
+            $self->{ENGINE} = 'Tesseract'
+        } elsif ($nv =~ /cune/i) {
+            $self->{ENGINE} = 'Cuneiform'
+        } else {
+            $self->error("Could not interpret OCR engine '$nv'");
+        }
+    }
+    return $self->{ENGINE};
 }
 
 sub work_dir {
@@ -503,6 +519,7 @@ sub process_page {
     $pg->{ycb} = sub { return $yCounter -= 10; };
 
     my $mode = $self->mode();
+    my @lines;
     foreach my $area ($outDoc->getElementsByTagName('div')) {
         my $cls = &get_class($area);
         my $aCoord = &bbox($area);
@@ -540,10 +557,16 @@ sub process_page {
         }
         foreach my $para ($area->getElementsByTagName('p')) {
             $self->_start_text( $pg ) if ($mode eq 'Paragraph');
+            my $via = &get_via($para);
+            my %okWordClass = $via eq 'Cuneiform' ?
+                ( ocr_line => 1 ) : ( ocrx_word => 1, ocr_word => 1 );
             foreach my $line ($para->getChildNodes()) {
                 my $lCls = &get_class($line);
                 my @words;
-                if ($lCls eq 'ocr_line') {
+                if ($via eq 'Cuneiform') {
+                    # There are no isolated words, just the line
+                    @words = ($line);
+                } elsif ($lCls eq 'ocr_line') {
                     @words = $line->getChildNodes();
                 } elsif ($lCls eq 'ocr_word') {
                     # I have not seen this - a line with a single word
@@ -557,18 +580,18 @@ sub process_page {
                 my $lineData = {
                     words => [],
                 };
-                my @txtLine;
+                push @lines, $lineData;
                 foreach my $word (@words) {
                     my $wCls = &get_class($word);
-                    next unless ($wCls eq 'ocrx_word' || $wCls eq 'ocr_word');
+                    next unless ($okWordClass{$wCls});
                     my $txt = join('',  &text_for_node($word));
                     next if ($txt =~ /^[\s\n\r]*$/);
                     push @{$lineData->{words}}, $txt;
                     $self->_start_text( $pg ) if ($mode eq 'Word');
                     push @{$pg->{words}}, [$txt, &bbox($word), $lineData];
                 }
-                $self->{TEXT} .= 
-                    ($lineData->{line} = join(' ', @{$lineData->{words}}))."\n";
+                
+                $lineData->{line} = join(' ', @{$lineData->{words}})."\n";
             }
         }
     }
@@ -577,6 +600,11 @@ sub process_page {
     $self->_write_text();
     my $bar = '-' x 30;
     $self->{TEXT} .= sprintf("\n%s %2d %s\n\n", $bar, $pg->{PAGENUM}, $bar);
+    foreach my $lineDat (@lines) {
+        if (my $words = $lineDat->{kept}) {
+            $self->{TEXT} .= join(' ', @{$words})."\n";
+        }
+    }
     # Free the XML object:
     $outDoc->dispose();
 }
@@ -612,6 +640,17 @@ sub get_class {
     if (!$node->can('getAttributeNode')) {
         return "";
     } elsif (my $v = $node->getAttributeNode('class')) {
+        return $v->getValue();
+    } else {
+        return "";
+    }
+}
+
+sub get_via {
+    my $node = shift;
+    if (!$node->can('getAttributeNode')) {
+        return "";
+    } elsif (my $v = $node->getAttributeNode('via')) {
         return $v->getValue();
     } else {
         return "";
@@ -678,7 +717,6 @@ sub _commit_text {
         # Render the text in the scratch space to calculate actual size
         my $wid = $scratch->advancewidth($chars);
         $pdfW += $wid; 
-        # warn "    ".join(',', @{$box})."   '$chars' = $wid\n";
         $cnum += length($chars);
         $w += $x2 - $x1 + 1;
         $h += $y2 - $y1 + 1;
@@ -810,6 +848,7 @@ sub _write_text {
                     next;
                 }
             }
+            push @{$lineDat->{kept}}, $txt;
             my ($x, $y) = ($box->[0], $box->[3]);
             if ($angle) {
                 # Pivot is about lower left corner
@@ -838,8 +877,71 @@ sub xml_for_image {
     return $xml if (-s $xml);
     my $hocr = $self->hocr_for_image( $src );
     return "" unless ($hocr);
-    # Newer HOCR files appear to be ok... ?
-    return $hocr if ($hocr =~ /\.hocr$/);
+    if ($hocr =~ /\.hocr$/) {
+        # Newer HOCR files appear to be ok... ?
+        return $hocr;
+    } elsif ($hocr =~ /\.c.html$/) {
+        # Cuneiform needs some basic cleanup
+        return $self->_clean_cuneiform_hocr( $hocr, $xml );
+    } else {
+        return $self->_clean_tesseract_hocr( $hocr, $xml );
+    }
+}
+
+sub _clean_cuneiform_hocr {
+    my $self = shift;
+    my ( $hocr, $xml ) = @_;
+
+    # Cuneiform included unclosed meta tags that caused XML parsing problems
+    # It also includes character-by-character positional data that do not
+    # interst me.
+    unless (open(HTML, "<$hocr")) {
+        $self->error("Failed to open HTML file for cleaning", $!, $hocr);
+        return "";
+    }
+    unless (open(XML, ">$xml")) {
+        $self->error("Failed to create XML file", $!, $xml);
+        close HTML;
+        return "";
+    }
+    while (<HTML>) {
+        if (/^(\s*<meta.+[^\/\s])\s*>\s*$/) {
+            # Close the meta tag
+            print XML "$1 />\n";
+        } elsif (/^(<p[^>]*>)?(<span.+class='ocr_line'.+)/) {
+            # cuneiform appears to structure all the OCR'ed data in lines
+            # 
+            my ($para, $line) = ($1, $2);
+            if ($para) {
+                $para =~ s/\>$//;
+                # Quote attributes
+                $para =~ s/=(\S+)/='$1'/g;
+                # Try to normalize the structure to be a bit more like
+                # Tesseract, to make later parsing easier
+                print XML "<div class='ocr_carea'>";
+                # Also embed a 'via' flag to guide parsing mode
+                print XML "$para via='Cuneiform' class='ocr_par'>\n"
+            }
+            # I do not care about the per-character bound boxes:
+            $line =~ s/<span class='ocr_cinfo'.+?<\/span>//g;
+            # Close break tags:
+            $line =~ s/<br>/<br \/>/g;
+            $line =~ s/[\n\r]+$//;
+            print XML "  $line\n";
+        } elsif (/^\s*<\/p>\s*$/) {
+            print XML "</p></div>\n";
+        } else {
+            print XML $_;
+        }
+    }
+    close XML;
+    close HTML;
+    return $xml;
+}
+    
+sub _clean_tesseract_hocr {
+    my $self = shift;
+    my ( $hocr, $xml ) = @_;
 
     # Older tesseract hOCR includes non-ASCII encoded characters.
     # These break DOM parsing, at least for my libraries
@@ -943,28 +1045,32 @@ sub xml_for_image {
 sub hocr_for_image {
     # https://en.wikipedia.org/wiki/HOCR
     my $self = shift;
-    my $src  = shift;
-    my $base = $self->derived_filename($src, "-HOCR", 'noSfx');
-    if (-s "$base.html") {
-        # Older versions of Tesseract
-        return "$base.html";
-    } elsif (-s "$base.hocr") {
-        # At least from v 3.03
-        return "$base.hocr";
+    my $src    = shift;
+    my $base   = $self->derived_filename($src, "-HOCR", 'noSfx');
+    my $engine = $self->engine();
+    my $cmd;
+    my @targets;
+    if ($engine eq 'Cuneiform') {
+        @targets = ("$base.c.html");
+        $cmd = sprintf("cuneiform -f hocr -i \"%s\" -o \"%s\"",
+                       $src, $targets[0]);
+    } else {
+        # Naming change - older versions use .html
+        @targets = ("$base.hocr", "$base.html");
+        $cmd = sprintf("tesseract \"%s\" \"%s\" hocr",
+                       $src, $base);
     }
-    # Neither present, we need to generate it
-    # my $cmd = "tesseract \"$src\" \"$base\" -psm 1 hocr";
-    my $cmd = "tesseract \"$src\" \"$base\" hocr";
+    foreach my $out (@targets) {
+        return $out if (-s $out);
+    }
+
+    # If we are here then we need to try to generate the file
     $self->log("OCR Command: $cmd");
     system($cmd);
-    if (-s "$base.html") {
-        # Older versions of Tesseract
-        return "$base.html";
-    } elsif (-s "$base.hocr") {
-        # At least from v 3.03
-        return "$base.hocr";
+    foreach my $out (@targets) {
+        return $out if (-s $out);
     }
-    $self->error("Failed to find either .hocr or .html HOCR output");
+    $self->error("Could not find expected hOCR output file", @targets);
     return "";
 }
 
